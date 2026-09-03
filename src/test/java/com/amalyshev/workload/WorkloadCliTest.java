@@ -1,0 +1,124 @@
+package com.amalyshev.workload;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.Test;
+import picocli.CommandLine;
+
+class WorkloadCliTest {
+
+  private static WorkloadCli parse(String... args) {
+    WorkloadCli cli = new WorkloadCli();
+    new CommandLine(cli).setCaseInsensitiveEnumValuesAllowed(true).parseArgs(args);
+    return cli;
+  }
+
+  @Test
+  void composesTheJdbcUrlFromHostsAndAppliesTheDefaultPort() {
+    assertThat(parse("-H", "a,b:5434,c", "-d", "qbet").jdbcUrl())
+        .isEqualTo("jdbc:postgresql://a:5433,b:5434,c:5433/qbet");
+  }
+
+  @Test
+  void keepsAnExplicitUrlVerbatim() {
+    String url = "jdbc:postgresql://host:5433/db?sslmode=verify-full";
+    assertThat(parse("--url", url, "-H", "ignored").jdbcUrl()).isEqualTo(url);
+  }
+
+  @Test
+  void addsSslAndSmartDriverSettingsToTheUrl() {
+    assertThat(parse("-H", "node1", "--ssl-mode", "require", "--ssl-root-cert", "/tmp/ca.crt")
+        .jdbcUrl())
+        .isEqualTo("jdbc:postgresql://node1:5433/yugabyte?sslmode=require&sslrootcert=/tmp/ca.crt");
+    assertThat(parse("-H", "node1", "--driver", "yugabytedb", "--topology-keys", "aws.us-east-1.a")
+        .jdbcUrl())
+        .isEqualTo(
+            "jdbc:yugabytedb://node1:5433/yugabyte?load-balance=true&topology-keys=aws.us-east-1.a");
+  }
+
+  @Test
+  void leavesIpv6LiteralsAlone() {
+    assertThat(parse("-H", "[::1]:5433").jdbcUrl())
+        .isEqualTo("jdbc:postgresql://[::1]:5433/yugabyte");
+    assertThat(parse("-H", "[::1]").jdbcUrl()).isEqualTo("jdbc:postgresql://[::1]:5433/yugabyte");
+  }
+
+  @Test
+  void translatesConnectionOptionsIntoSpringProperties() {
+    WorkloadCli cli = parse("-H", "node1", "-U", "admin", "-W", "secret", "--driver", "yugabytedb",
+        "--statement-timeout", "90s", "-o", "reWriteBatchedInserts=false", "-w", "cpu-heavy");
+    Map<String, Object> properties = cli.springProperties(cli.steps());
+    assertThat(properties)
+        .containsEntry("spring.datasource.username", "admin")
+        .containsEntry("spring.datasource.password", "secret")
+        .containsEntry("spring.datasource.driverClassName", "com.yugabyte.Driver")
+        .containsEntry("spring.datasource.hikari.data-source-properties.options",
+            "-c statement_timeout=90000")
+        .containsEntry("spring.datasource.hikari.data-source-properties.reWriteBatchedInserts",
+            "false");
+  }
+
+  @Test
+  void sizesThePoolForTheWidestStepUnlessItIsGivenExplicitly() {
+    WorkloadCli cli = parse("--step", "cpu-heavy:1m:threads=64", "--step", "connection-churn:1m");
+    assertThat(cli.poolSize(cli.steps())).isEqualTo(68);
+    WorkloadCli explicit = parse("--pool-size", "12", "-w", "cpu-heavy", "-n", "64");
+    assertThat(explicit.poolSize(explicit.steps())).isEqualTo(12);
+  }
+
+  @Test
+  void buildsTheChainFromStepsChainAndDefaults() {
+    WorkloadCli cli = parse("-t", "5m", "-n", "20", "--step", "cpu-heavy:20m",
+        "--chain", "connection-churn:30m,basic-read-write:1m:threads=3");
+    List<WorkloadStep> steps = cli.steps();
+    assertThat(steps).extracting(WorkloadStep::workload)
+        .containsExactly("cpu-heavy", "connection-churn", "basic-read-write");
+    assertThat(steps).extracting(step -> step.params().getNumThreads()).containsExactly(20, 20, 3);
+    assertThat(WorkloadCli.totalDuration(steps)).isEqualTo(Duration.ofMinutes(51));
+  }
+
+  @Test
+  void appliesTheSingleWorkloadDefaultsWhenNoChainIsGiven() {
+    WorkloadCli cli = parse("-w", "cpu-heavy", "-t", "20m", "--no-load", "--cleanup");
+    List<WorkloadStep> steps = cli.steps();
+    assertThat(steps).hasSize(1);
+    assertThat(steps.get(0).params().getDuration()).isEqualTo(Duration.ofMinutes(20));
+    assertThat(steps.get(0).params().isLoadData()).isFalse();
+    assertThat(steps.get(0).params().isDoCleanup()).isTrue();
+  }
+
+  @Test
+  void appliesEveryBooleanFlagInBothDirections() {
+    WorkloadParams on = parse("-w", "cpu-heavy", "--cleanup", "--load", "--ddl").steps()
+        .get(0).params();
+    assertThat(on.isDoCleanup()).isTrue();
+    assertThat(on.isLoadData()).isTrue();
+    assertThat(on.isRunDDl()).isTrue();
+    WorkloadParams off = parse("-w", "cpu-heavy", "--no-cleanup", "--no-load", "--no-ddl").steps()
+        .get(0).params();
+    assertThat(off.isDoCleanup()).isFalse();
+    assertThat(off.isLoadData()).isFalse();
+    assertThat(off.isRunDDl()).isFalse();
+  }
+
+  @Test
+  void rejectsContradictorySwitches() {
+    assertThatThrownBy(() -> parse("-w", "cpu-heavy", "--load", "--no-load").steps())
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("--load and --no-load contradict");
+  }
+
+  @Test
+  void refusesAmbiguousOrMissingWorkloadSelection() {
+    assertThatThrownBy(() -> parse("-H", "node1").steps())
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("No workload selected");
+    assertThatThrownBy(() -> parse("-w", "cpu-heavy", "--chain", "cpu-heavy:1m").steps())
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("cannot be combined");
+  }
+}

@@ -1,0 +1,6 @@
+# Example chain: CPU pressure first, then connection churn against a warm cluster.
+# Run with: ./workload-gen.sh -H node1,node2,node3 -W secret --chain-file chains/cpu-then-churn.chain
+
+cpu-heavy:20m:cleanup                 # recreate and load the table, then burn CPU for 20 minutes
+connection-churn:30m:threads=32       # churn connections while the cluster is still hot
+cpu-heavy:10m:no-ddl,no-load,amp=80   # back to CPU, twice as expensive per query, table reused
